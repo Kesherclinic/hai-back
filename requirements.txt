@@ -1,0 +1,20 @@
+# HAI Backend — Python Dependencies (גרסת "הקלטה בלבד")
+# Install: pip install -r requirements.txt
+#
+# זו גרסה מוקטנת בכוונה — בלי ספריות ה-ML הכבדות (deepface / torch / torchaudio /
+# speechbrain / librosa / opencv / tf-keras). המטרה: לאפשר פריסה על תוכנית אירוח
+# חינמית/קלה כל עוד השרת רק מקליט ושומר, בלי להריץ ניתוח ביומטרי.
+#
+# כדי להחזיר את הניתוח המלא בעתיד (יחד עם שחזור הקוד המקורי ב-main.py),
+# החלף קובץ זה בחזרה לגרסה המלאה המקורית.
+
+# ── API Framework ──
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9     # Required for file uploads
+
+# ── Validation ──
+pydantic==2.7.1
+
+# ── Firebase ──
+firebase-admin==6.5.0
