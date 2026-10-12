@@ -29,7 +29,7 @@ from services.firebase_service import (
     create_subject, get_subject, list_subjects,
     create_session, update_session_status, get_session, list_sessions,
     get_emotion_results, get_conclusion, list_conclusions,
-    save_full_session_results
+    save_full_session_results, upload_session_video
 )
 
 app = FastAPI(
@@ -93,8 +93,22 @@ async def analyze(
         shutil.copyfileobj(video.file, f)
 
     # מצב הקלטה בלבד: שומר את הסרטון ומסמן "recorded" — בלי להפעיל ניתוח ביומטרי.
-    # כדי להחזיר את הניתוח המלא, מחק את השורה הבאה והחזר את שתי השורות המוערות שאחריה.
-    update_session_status(session_id, "recorded", video_path=str(video_path))
+    # כדי להחזיר את הניתוח המלא, מחק את השורה עם upload_session_video/update_session_status
+    # למטה והחזר את שתי השורות המוערות שאחריה.
+    #
+    # הדיסק של Render הוא זמני (ephemeral) — קבצים שנשמרים רק שם נמחקים בכל
+    # הפעלה מחדש/דיפלוי. לכן מעלים את ההקלטה ל-Firebase Storage מיד אחרי
+    # השמירה המקומית, כדי שהיא תישמר לצמיתות ותהיה נגישה לך בכל זמן.
+    try:
+        storage_url = upload_session_video(session_id, video_path)
+        update_session_status(session_id, "recorded", video_path=storage_url)
+        # מחיקת העותק המקומי אחרי העלאה מוצלחת — חוסך מקום בדיסק הזמני של Render
+        video_path.unlink(missing_ok=True)
+    except Exception as e:
+        # אם ההעלאה ל-Firebase נכשלה, לפחות שומרים את הנתיב המקומי כדי לא לאבד
+        # את ההקלטה (אם Render לא התאתחל בינתיים), ומתעדים את השגיאה.
+        print(f"⚠️ Failed to upload session video to Firebase Storage: {e}")
+        update_session_status(session_id, "recorded", video_path=str(video_path), storage_error=str(e))
     # import json
     # stimulus_map_parsed = json.loads(stimulus_map) if stimulus_map else {}
     # background_tasks.add_task(run_full_analysis, session_id, session["subject_id"], video_path, stimulus_map_parsed)
