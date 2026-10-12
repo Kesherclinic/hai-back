@@ -1,14 +1,19 @@
 """
 Firebase Service — HAI Backend
-Connects Python backend to Firebase Firestore
-Handles: subjects, sessions, emotion_results, conclusions
+Connects Python backend to Firebase Firestore + Firebase Storage
+Handles: subjects, sessions, emotion_results, conclusions, session video uploads
 """
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
+import uuid
 import os
+
+# ── Firebase Storage bucket for this project ──
+FIREBASE_STORAGE_BUCKET = "hai-app-2ebc3.firebasestorage.app"
 
 # ── Initialize Firebase ──
 _db = None
@@ -24,7 +29,9 @@ def get_db():
             )
         if not firebase_admin._apps:
             cred = credentials.Certificate(str(key_path))
-            firebase_admin.initialize_app(cred)
+            firebase_admin.initialize_app(cred, {
+                "storageBucket": FIREBASE_STORAGE_BUCKET,
+            })
         _db = firestore.client()
     return _db
 
@@ -83,7 +90,7 @@ def create_session(subject_id: str, protocol_version: str = "1.0") -> str:
         subject_id:        str
         protocol_version:  str
         status:            "pending" | "recording" | "processing" | "complete" | "error"
-        video_path:        str | None      ← local path or Firebase Storage URL
+        video_path:        str | None      ← Firebase Storage download URL (or local path on failure)
         created_at:        timestamp
         completed_at:      timestamp | None
         error:             str | None
@@ -124,6 +131,41 @@ def list_sessions(subject_id: str = None) -> list[dict]:
     if subject_id:
         q = q.where("subject_id", "==", subject_id)
     return [{"id": d.id, **d.to_dict()} for d in q.stream()]
+
+
+# ══════════════════════════════════════════
+# SESSION VIDEO — הקלטת הנבדק (Firebase Storage)
+# ══════════════════════════════════════════
+
+def upload_session_video(session_id: str, local_path: Path) -> str:
+    """
+    Uploads a subject's recorded session video (local .webm file, currently
+    sitting on Render's ephemeral disk) to Firebase Storage, so it survives
+    server restarts/redeploys and is reachable by Nico at any time.
+
+    Stored at: recordings/{session_id}.webm
+    Returns a public Firebase Storage download URL (same format used for the
+    baseline relaxation video).
+    """
+    get_db()  # ensures firebase_admin app (with storageBucket) is initialized
+
+    storage_path = f"recordings/{session_id}.webm"
+    bucket = storage.bucket()
+    blob = bucket.blob(storage_path)
+    blob.upload_from_filename(str(local_path))
+
+    # Attach a download token so the file is fetchable via a stable public URL
+    # (same mechanism Firebase Console uses when you click "Get download URL").
+    token = str(uuid.uuid4())
+    blob.metadata = {"firebaseStorageDownloadTokens": token}
+    blob.patch()
+
+    download_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
+        f"/o/{quote(storage_path, safe='')}?alt=media&token={token}"
+    )
+    print(f"✅ Session video uploaded to Firebase Storage: {storage_path}")
+    return download_url
 
 
 # ══════════════════════════════════════════
