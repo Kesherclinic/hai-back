@@ -242,7 +242,10 @@ def _expand_timeline_to_csv(timeline_json: str) -> str:
                 seg.get("sub_phase", "") if seg.get("sub_phase") is not None else "",
                 seg.get("label_he", "") or "",
             ])
-    return output.getvalue()
+    # BOM בתחילת הקובץ — כדי שגם תוכנות שלא מסתכלות על כותרת ה-Content-Type
+    # (כמו Excel בפתיחת קובץ שהורד מקומית) יזהו נכון שהקובץ ב-UTF-8 ויציגו
+    # את העברית נכון, במקום לנחש קידוד אחר ולהציג ג'יבריש.
+    return "﻿" + output.getvalue()
 
 
 def upload_session_timeline(subject_id: str, session_id: str, timeline_json: str) -> str:
@@ -262,10 +265,17 @@ def upload_session_timeline(subject_id: str, session_id: str, timeline_json: str
     storage_path = f"recordings/{folder}/{session_id}_timeline.csv"
     bucket = storage.bucket()
     blob = bucket.blob(storage_path)
-    blob.upload_from_string(csv_content, content_type="text/csv")
+    # charset=utf-8 מפורש — בלעדיו, דפדפן שפותח את הלינק ישירות מנחש קידוד
+    # (לרוב Latin-1/Windows-1252) ומציג את העברית כג'יבריש, למרות שהבתים
+    # בקובץ עצמו תקינים ב-UTF-8.
+    blob.upload_from_string(csv_content, content_type="text/csv; charset=utf-8")
 
     token = str(uuid.uuid4())
     blob.metadata = {"firebaseStorageDownloadTokens": token}
+    # Content-Disposition: attachment — בלעדיו, הדפדפן מציג את הקובץ כטקסט
+    # בתוך הטאב כשנכנסים ללינק; עם זה, הוא יורד/נשמר ישירות כקובץ .csv בעל
+    # שם קריא, מוכן לפתיחה ב-Excel/Numbers כטבלה מסודרת.
+    blob.content_disposition = f'attachment; filename="{session_id}_timeline.csv"'
     blob.patch()
 
     download_url = (
