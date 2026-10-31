@@ -29,7 +29,7 @@ from services.firebase_service import (
     create_subject, get_subject, list_subjects,
     create_session, update_session_status, get_session, list_sessions,
     get_emotion_results, get_conclusion, list_conclusions,
-    save_full_session_results, upload_session_video
+    save_full_session_results, upload_session_video, upload_session_timeline
 )
 
 app = FastAPI(
@@ -84,6 +84,7 @@ async def analyze(
     background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     stimulus_map: str = Form(None),
+    timeline: str = Form(None),
 ):
     session = get_session(session_id)
     if not session:
@@ -91,6 +92,8 @@ async def analyze(
     video_path = UPLOAD_DIR / f"{session_id}.webm"
     with open(video_path, "wb") as f:
         shutil.copyfileobj(video.file, f)
+
+    subject_id = session["subject_id"]
 
     # מצב הקלטה בלבד: שומר את הסרטון ומסמן "recorded" — בלי להפעיל ניתוח ביומטרי.
     # כדי להחזיר את הניתוח המלא, מחק את השורה עם upload_session_video/update_session_status
@@ -100,8 +103,19 @@ async def analyze(
     # הפעלה מחדש/דיפלוי. לכן מעלים את ההקלטה ל-Firebase Storage מיד אחרי
     # השמירה המקומית, כדי שהיא תישמר לצמיתות ותהיה נגישה לך בכל זמן.
     try:
-        storage_url = upload_session_video(session_id, video_path)
-        update_session_status(session_id, "recorded", video_path=storage_url)
+        storage_url = upload_session_video(subject_id, session_id, video_path)
+
+        # טבלת הזמנים (מה הנבדק נחשף אליו בכל שנייה) — מועלית בנפרד, לתוך אותה
+        # תיקיית נבדק. אם ההעלאה הזו נכשלת, זה לא אמור לפגוע בשמירת הסרטון עצמו
+        # (הסרטון הוא הדבר הקריטי), לכן הכישלון שלה מטופל בנפרד ולא עוצר את הזרימה.
+        timeline_url = None
+        if timeline:
+            try:
+                timeline_url = upload_session_timeline(subject_id, session_id, timeline)
+            except Exception as te:
+                print(f"⚠️ Failed to upload session timeline to Firebase Storage: {te}")
+
+        update_session_status(session_id, "recorded", video_path=storage_url, timeline_path=timeline_url)
         # מחיקת העותק המקומי אחרי העלאה מוצלחת — חוסך מקום בדיסק הזמני של Render
         video_path.unlink(missing_ok=True)
     except Exception as e:
