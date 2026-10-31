@@ -11,6 +11,10 @@ from pathlib import Path
 from urllib.parse import quote
 import uuid
 import os
+import json
+import csv
+import io
+import re
 
 # ── Firebase Storage bucket for this project ──
 FIREBASE_STORAGE_BUCKET = "hai-app-2ebc3.firebasestorage.app"
@@ -137,19 +141,54 @@ def list_sessions(subject_id: str = None) -> list[dict]:
 # SESSION VIDEO — הקלטת הנבדק (Firebase Storage)
 # ══════════════════════════════════════════
 
-def upload_session_video(session_id: str, local_path: Path) -> str:
+def _subject_folder_name(subject_id: str, subject_name: str = None) -> str:
+    """
+    Builds a readable-but-unique Firebase Storage folder name for a subject:
+    the subject's name (sanitized) plus a short suffix taken from their
+    subject_id — e.g. "דוד כהן_a3f91c" — so two subjects who happen to share
+    the same name (e.g. two people both named "דוד") still get separate
+    folders and their recordings never get mixed into one place. Falls back
+    to the bare subject_id if the subject has no name on file.
+    """
+    short_id = (subject_id or "")[:6] or "000000"
+    name = (subject_name or "").strip()
+    # מסירים תווים שעלולים ליצור תת-תיקיות לא מכוונות (/) או לשבור את הנתיב
+    name = re.sub(r"[\/\\\x00-\x1f]", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    name = name[:40]  # מגבילים אורך כדי לא ליצור נתיבים ארוכים מדי בסטוראג'
+    if not name:
+        return subject_id
+    return f"{name}_{short_id}"
+
+
+def get_subject_folder_name(subject_id: str) -> str:
+    """Looks up the subject's name and returns their Storage folder name."""
+    subject = get_subject(subject_id)
+    name = subject.get("name") if subject else None
+    return _subject_folder_name(subject_id, name)
+
+
+def upload_session_video(subject_id: str, session_id: str, local_path: Path) -> str:
     """
     Uploads a subject's recorded session video (local .webm file, currently
     sitting on Render's ephemeral disk) to Firebase Storage, so it survives
     server restarts/redeploys and is reachable by Nico at any time.
 
-    Stored at: recordings/{session_id}.webm
+    Stored at: recordings/{subject name + short id}/{session_id}.webm —
+    grouped in a per-subject folder, alongside that same session's timeline
+    CSV (see upload_session_timeline below), so both files for a given
+    subject sit together in Storage.
     Returns a public Firebase Storage download URL (same format used for the
     baseline relaxation video).
+
+    NOTE: sessions recorded before this change are still sitting at the old
+    flat path (recordings/{session_id}.webm), or the earlier
+    recordings/{subject_id}/... path — they are not moved.
     """
     get_db()  # ensures firebase_admin app (with storageBucket) is initialized
 
-    storage_path = f"recordings/{session_id}.webm"
+    folder = get_subject_folder_name(subject_id)
+    storage_path = f"recordings/{folder}/{session_id}.webm"
     bucket = storage.bucket()
     blob = bucket.blob(storage_path)
     blob.upload_from_filename(str(local_path))
@@ -165,6 +204,75 @@ def upload_session_video(session_id: str, local_path: Path) -> str:
         f"/o/{quote(storage_path, safe='')}?alt=media&token={token}"
     )
     print(f"✅ Session video uploaded to Firebase Storage: {storage_path}")
+    return download_url
+
+
+def _expand_timeline_to_csv(timeline_json: str) -> str:
+    """
+    Takes the raw segment log sent from the frontend (one row per phase/step
+    the subject was in, each with start_sec/end_sec relative to the start of
+    the recording) and expands it into a per-second table: one CSV row for
+    every whole second of the recording, showing exactly what the subject was
+    exposed to at that second. This makes it trivial to line this table up
+    later against any other per-second signal (e.g. frame-by-frame emotion
+    scores), instead of having to look up which segment a given second falls
+    into by hand.
+    """
+    segments = json.loads(timeline_json) if timeline_json else []
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["second", "phase", "domain", "domain_label_he", "step", "step_label_he", "sub_phase", "label_he"])
+    for seg in segments:
+        start = seg.get("start_sec")
+        if start is None:
+            continue
+        end = seg.get("end_sec")
+        if end is None:
+            end = start  # הקטע האחרון, אם משום מה לא נסגר כראוי — שורה אחת בלבד
+        first_sec = int(start)
+        last_sec = max(first_sec, int(end))
+        for sec in range(first_sec, last_sec + 1):
+            writer.writerow([
+                sec,
+                seg.get("phase", ""),
+                seg.get("domain", "") or "",
+                seg.get("domain_label_he", "") or "",
+                seg.get("step", "") or "",
+                seg.get("step_label_he", "") or "",
+                seg.get("sub_phase", "") if seg.get("sub_phase") is not None else "",
+                seg.get("label_he", "") or "",
+            ])
+    return output.getvalue()
+
+
+def upload_session_timeline(subject_id: str, session_id: str, timeline_json: str) -> str:
+    """
+    Expands the frontend's timeline log (what the subject was exposed to,
+    and when) into a per-second CSV table, and uploads it to Firebase
+    Storage in the same per-subject folder as that session's video — so
+    Nico can open both together and know exactly what was on screen/in the
+    subject's ears at any given second of the recording.
+
+    Stored at: recordings/{subject name + short id}/{session_id}_timeline.csv
+    """
+    get_db()
+    csv_content = _expand_timeline_to_csv(timeline_json)
+
+    folder = get_subject_folder_name(subject_id)
+    storage_path = f"recordings/{folder}/{session_id}_timeline.csv"
+    bucket = storage.bucket()
+    blob = bucket.blob(storage_path)
+    blob.upload_from_string(csv_content, content_type="text/csv")
+
+    token = str(uuid.uuid4())
+    blob.metadata = {"firebaseStorageDownloadTokens": token}
+    blob.patch()
+
+    download_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
+        f"/o/{quote(storage_path, safe='')}?alt=media&token={token}"
+    )
+    print(f"✅ Session timeline uploaded to Firebase Storage: {storage_path}")
     return download_url
 
 
