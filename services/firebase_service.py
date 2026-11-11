@@ -207,6 +207,25 @@ def upload_session_video(subject_id: str, session_id: str, local_path: Path) -> 
     return download_url
 
 
+def generate_signed_video_url(subject_id: str, session_id: str, expires_minutes: int = 10) -> str | None:
+    """
+    שלב 0 (תוכנית העבודה — אבטחה ופרטיות): קישור הורדה זמני לסרטון, שפג תוקפו
+    אחרי expires_minutes דקות ונוצר רק דרך קריאה מאומתת לבקאנד (ראו
+    /recordings/{session_id}/video ב-main.py) — במקום הטוקן הציבורי הקבוע
+    שמוחזר מ-upload_session_video (שעדיין קיים כרגע לצורך תאימות לאחור, ראו
+    הערה שם). מחזיר None אם הקובץ לא קיים בסטוראג'.
+    """
+    get_db()
+    folder = get_subject_folder_name(subject_id)
+    storage_path = f"recordings/{folder}/{session_id}.webm"
+    bucket = storage.bucket()
+    blob = bucket.blob(storage_path)
+    if not blob.exists():
+        return None
+    from datetime import timedelta
+    return blob.generate_signed_url(expiration=timedelta(minutes=expires_minutes), version="v4")
+
+
 def _expand_timeline_to_csv(timeline_json: str) -> str:
     """
     Takes the raw segment log sent from the frontend (one row per phase/step
@@ -284,6 +303,22 @@ def upload_session_timeline(subject_id: str, session_id: str, timeline_json: str
     )
     print(f"✅ Session timeline uploaded to Firebase Storage: {storage_path}")
     return download_url
+
+
+def generate_signed_timeline_url(subject_id: str, session_id: str, expires_minutes: int = 10) -> str | None:
+    """
+    שלב 0 — מקביל ל-generate_signed_video_url, עבור קובץ ה-CSV של ציר הזמן.
+    מחזיר None אם הקובץ לא קיים בסטוראג'.
+    """
+    get_db()
+    folder = get_subject_folder_name(subject_id)
+    storage_path = f"recordings/{folder}/{session_id}_timeline.csv"
+    bucket = storage.bucket()
+    blob = bucket.blob(storage_path)
+    if not blob.exists():
+        return None
+    from datetime import timedelta
+    return blob.generate_signed_url(expiration=timedelta(minutes=expires_minutes), version="v4")
 
 
 # ══════════════════════════════════════════
