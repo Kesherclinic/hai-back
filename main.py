@@ -13,11 +13,12 @@ FastAPI server — גרסת "הקלטה בלבד" (ללא ניתוח ביומט�
 4. עדכן את requirements.txt חזרה לגרסה המלאה עם deepface/torch/speechbrain/librosa וכו'.
 """
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, Header, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import uuid
 import shutil
+import os
 from pathlib import Path
 
 # ── מושבת זמנית (ML כבד) — ראה הערה למעלה כדי להחזיר ──
@@ -29,18 +30,48 @@ from services.firebase_service import (
     create_subject, get_subject, list_subjects,
     create_session, update_session_status, get_session, list_sessions,
     get_emotion_results, get_conclusion, list_conclusions,
-    save_full_session_results, upload_session_video, upload_session_timeline
+    save_full_session_results, upload_session_video, upload_session_timeline,
+    generate_signed_video_url, generate_signed_timeline_url,
 )
+
+# ══════════════════════════════════════════
+# שלב 0 (תוכנית העבודה — אבטחה ופרטיות): נעילת הבקאנד
+# ══════════════════════════════════════════
+# פתרון ביניים מהיר ודחוף: כל קריאה לבקאנד חייבת לשאת הדר X-API-Key עם סוד
+# משותף אחד לכל האפליקציה (לא אימות אישי — זה יוחלף בשלב 1 בטוקן Firebase
+# אמיתי לכל משתמש). הסוד נשמר אך ורק כמשתנה סביבה ב-Render, לעולם לא בקוד.
+API_SHARED_SECRET = os.environ.get("API_SHARED_SECRET")
+if not API_SHARED_SECRET:
+    print("⚠️ API_SHARED_SECRET אינו מוגדר — כל קריאה לבקאנד תיחסם (401) עד שיוגדר ב-Render.")
+
+async def verify_shared_secret(x_api_key: str = Header(None)):
+    if not API_SHARED_SECRET or x_api_key != API_SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# דומיין(ים) מורשים לקרוא לבקאנד — מחליף את allow_origins=["*"] הפתוח לכולם.
+# מוגדר דרך משתנה סביבה FRONTEND_ORIGIN ב-Render (אפשר כמה דומיינים מופרדים
+# בפסיק, למשל דומיין production + דומייני preview של Vercel). חשוב: חייבים
+# להגדיר כאן בדיוק את הדומיין האמיתי של haifront — דומיין שגוי יחסום את
+# האפליקציה עצמה, לא רק תוקפים.
+_frontend_origins_env = os.environ.get("FRONTEND_ORIGIN", "")
+FRONTEND_ORIGINS = [o.strip() for o in _frontend_origins_env.split(",") if o.strip()]
+if not FRONTEND_ORIGINS:
+    print("⚠️ FRONTEND_ORIGIN אינו מוגדר ב-Render — נופלים זמנית לדומיין production הידוע; מומלץ בכל זאת להגדיר אותו ב-Render במקום להסתמך על הפולבאק הזה.")
+    FRONTEND_ORIGINS = ["https://haifront-sigma.vercel.app"]
 
 app = FastAPI(
     title="HAI Backend — Heart Affinity Index",
     description="Recording-only mode: captures and stores subject video; biometric analysis not yet enabled",
-    version="1.1.0-recording-only"
+    version="1.1.0-recording-only",
 )
+# הערה: ה-dependency לא מוגדר ברמת האפליקציה כולה (שהיה חוסם גם את "/"), אלא
+# בנפרד על כל endpoint רגיש למטה — כדי ש-"/" יישאר פתוח כ-health check
+# שRender (או כל מנגנון ניטור) יכול לפנות אליו בלי הדר, ועדיין לא יחשוף מידע
+# כלשהו (הוא מחזיר רק מחרוזת סטטוס קבועה).
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,16 +87,16 @@ def root():
     return {"status": "HAI backend running (recording only)", "version": "1.1.0-recording-only"}
 
 # ── SUBJECTS ──
-@app.post("/subjects")
+@app.post("/subjects", dependencies=[Depends(verify_shared_secret)])
 def new_subject(name: str, age: int = None, notes: str = ""):
     subject_id = create_subject(name=name, age=age, notes=notes)
     return {"subject_id": subject_id, "name": name}
 
-@app.get("/subjects")
+@app.get("/subjects", dependencies=[Depends(verify_shared_secret)])
 def all_subjects():
     return list_subjects()
 
-@app.get("/subjects/{subject_id}")
+@app.get("/subjects/{subject_id}", dependencies=[Depends(verify_shared_secret)])
 def one_subject(subject_id: str):
     s = get_subject(subject_id)
     if not s:
@@ -73,12 +104,12 @@ def one_subject(subject_id: str):
     return s
 
 # ── SESSIONS ──
-@app.post("/sessions")
+@app.post("/sessions", dependencies=[Depends(verify_shared_secret)])
 def new_session(subject_id: str, protocol_version: str = "1.0"):
     session_id = create_session(subject_id=subject_id, protocol_version=protocol_version)
     return {"session_id": session_id, "subject_id": subject_id}
 
-@app.post("/analyze/{session_id}")
+@app.post("/analyze/{session_id}", dependencies=[Depends(verify_shared_secret)])
 async def analyze(
     session_id: str,
     background_tasks: BackgroundTasks,
@@ -129,35 +160,61 @@ async def analyze(
 
     return {"session_id": session_id, "status": "recorded"}
 
-@app.get("/sessions/{session_id}")
+@app.get("/sessions/{session_id}", dependencies=[Depends(verify_shared_secret)])
 def one_session(session_id: str):
     s = get_session(session_id)
     if not s:
         raise HTTPException(404, "Session not found")
     return s
 
-@app.get("/sessions")
+@app.get("/sessions", dependencies=[Depends(verify_shared_secret)])
 def all_sessions(subject_id: str = None):
     return list_sessions(subject_id=subject_id)
 
 # ── RESULTS (לא יחזירו כלום כל עוד הניתוח מושבת — זה תקין, לא באג) ──
-@app.get("/results/{session_id}")
+@app.get("/results/{session_id}", dependencies=[Depends(verify_shared_secret)])
 def session_results(session_id: str):
     results = get_emotion_results(session_id)
     if not results:
         raise HTTPException(404, "Results not found")
     return results
 
-@app.get("/conclusions/{session_id}")
+@app.get("/conclusions/{session_id}", dependencies=[Depends(verify_shared_secret)])
 def session_conclusion(session_id: str):
     conclusion = get_conclusion(session_id)
     if not conclusion:
         raise HTTPException(404, "Conclusion not found")
     return conclusion
 
-@app.get("/conclusions")
+@app.get("/conclusions", dependencies=[Depends(verify_shared_secret)])
 def all_conclusions(subject_id: str = None):
     return list_conclusions(subject_id=subject_id)
+
+# ── RECORDINGS — קישורי הורדה זמניים (signed URLs), במקום הטוקן הציבורי הקבוע ──
+# שלב 0 (המשך): מחליפים את firebaseStorageDownloadTokens (שתקף לנצח לכל מי
+# שמחזיק את הלינק) בקישור חתום שפג תוקפו אחרי זמן קצר ונוצר רק דרך קריאה
+# מאומתת לבקאנד. ה-URL עצמו עדיין לא דורש התחברות (זו מגבלה של signed URLs),
+# אבל הוא נוצר רק למי שכבר עבר את verify_shared_secret וגם פג תוקף במהירות —
+# שיפור משמעותי לעומת טוקן שחי לנצח.
+@app.get("/recordings/{session_id}/video", dependencies=[Depends(verify_shared_secret)])
+def recording_video_url(session_id: str):
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    url = generate_signed_video_url(session["subject_id"], session_id)
+    if not url:
+        raise HTTPException(404, "Video not found")
+    return {"url": url}
+
+@app.get("/recordings/{session_id}/timeline", dependencies=[Depends(verify_shared_secret)])
+def recording_timeline_url(session_id: str):
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    url = generate_signed_timeline_url(session["subject_id"], session_id)
+    if not url:
+        raise HTTPException(404, "Timeline not found")
+    return {"url": url}
 
 # ── PIPELINE — מושבת זמנית, ראה הערה בראש הקובץ כדי להחזיר ──
 # async def run_full_analysis(session_id: str, subject_id: str, video_path: Path, stimulus_map: dict = {}):
