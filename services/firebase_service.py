@@ -81,6 +81,99 @@ def list_subjects() -> list[dict]:
 
 
 # ══════════════════════════════════════════
+# שלב 1 (תוכנית העבודה — אבטחה ופרטיות): זהות נבדקים אמיתית
+# ══════════════════════════════════════════
+# להבדיל מ-create_subject למעלה (שנועד לזרימה הישנה — נבדק אנונימי שממלא טופס
+# ומקבל subject_id חדש כל פעם), הפונקציות כאן מניחות שה-subject_id הוא כבר
+# ה-UID האמיתי שלו מ-Firebase Authentication (ראו auth_setup/bulk_create_subject_accounts.py).
+# כלומר: subjects/{subject_id} וה-UID של המשתמש ב-Firebase Auth הם בדיוק אותו
+# מזהה — אין טבלת מיפוי נפרדת.
+#
+# שדות חדשים ב-subjects/{uid}:
+#   login_username:     str   — שם המשתמש הנוכחי להתחברות (החלק שלפני @hai-subjects.local
+#                                בפסבדו-אימייל שנשלח ל-Firebase Auth). מתחיל כאחד מ-100
+#                                השמות שהוכנו מראש, ומתחלף לשם שהנבדק בוחר באיפוס הראשון.
+#   needs_reset:        bool  — True כל עוד הנבדק לא עשה את איפוס שם המשתמש+הסיסמא
+#                                הראשוני (נכון רק לחשבונות שהוכנו מראש).
+#   profile_completed:  bool  — True מרגע שטופס הפרטים האישיים (שם/גיל/מגדר/מייל) מולא
+#                                בפעם הראשונה. ברגע ש-True, בכניסות הבאות לא מציגים את
+#                                הטופס הזה שוב — רק מסך אישור "זהו הסשן השני/שלישי".
+#   session_count:      int   — כמות הסשנים שהווידאו שלהם נשמר בהצלחה. זה מה שקובע אם
+#                                זו הכניסה הראשונה (0) או סשן חוזר (1,2,...), ואיזה מספר
+#                                סשן להציג במסך האישור.
+#   role:               str   — "subject", משוכפל מה-custom claim בפיירבייס (לנוחות
+#                                תצוגה/שאילתות באדמין; לא משמש לבדיקת הרשאות בבקאנד —
+#                                לכך משמש ה-custom claim האמיתי בטוקן, ראו main.py).
+#
+# שדות קיימים (name/age/gender/notes) ממשיכים להתמלא רק דרך טופס הפרטים
+# האישיים (IntakePage/PersonalDetailsPage), ושם התיקייה בסטוראג' (ראו
+# get_subject_folder_name למעלה) ממשיך להיגזר מ-name בדיוק כמו היום — איפוס
+# שם המשתמש להתחברות לא נוגע בשם הזה בכלל.
+
+def create_provisioned_subject(uid: str, login_username: str) -> None:
+    """
+    נקרא רק מהסקריפט החד-פעמי שמכין את 100 חשבונות הנבדקים מראש
+    (auth_setup/bulk_create_subject_accounts.py). יוצר את מסמך ה-Firestore
+    התואם לחשבון Firebase Auth שכבר נוצר עם אותו uid בדיוק.
+    """
+    db = get_db()
+    db.collection("subjects").document(uid).set({
+        "name":              None,
+        "age":               None,
+        "gender":            None,
+        "notes":             "",
+        "created_at":        datetime.utcnow(),
+        "login_username":    login_username,
+        "needs_reset":       True,
+        "profile_completed": False,
+        "session_count":     0,
+        "role":              "subject",
+    })
+
+
+def update_login_credentials(uid: str, new_username: str) -> None:
+    """
+    נקרא מ-POST /auth/reset ב-main.py, אחרי שהסיסמא כבר עודכנה בפיירבייס
+    אוטנטיקיישן עצמו (auth.update_user) ושם המשתמש החדש אומת כפנוי. מסמן
+    שהאיפוס ההתחלתי בוצע, כדי שבכניסה הבאה לא יוצג מסך האיפוס הזה שוב.
+    """
+    db = get_db()
+    db.collection("subjects").document(uid).update({
+        "login_username": new_username,
+        "needs_reset":     False,
+    })
+
+
+def complete_subject_profile(uid: str, name: str, age: int = None,
+                              gender: str = None, notes: str = "") -> None:
+    """
+    נקרא מ-POST /subjects/me/profile, בפעם הראשונה בלבד (לפני שה-flag
+    profile_completed עולה ל-True). זהו המקום היחיד ששם הנבדק נקבע — ושם
+    התיקייה בסטוראג' (get_subject_folder_name) ממשיך להסתמך על אותו name.
+    """
+    db = get_db()
+    db.collection("subjects").document(uid).update({
+        "name":              name,
+        "age":               age,
+        "gender":            gender,
+        "notes":             notes,
+        "profile_completed": True,
+    })
+
+
+def increment_session_count(subject_id: str) -> int:
+    """
+    נקרא מ-main.py מיד אחרי שהווידאו של סשן נשמר בהצלחה (status="recorded").
+    זה המונה שקובע אם הכניסה הבאה של הנבדק תוצג כ"סשן שני/שלישי" (מסך אישור)
+    או כטופס פרטים אישיים (אם זו עדיין הכניסה הראשונה). מחזיר את המונה החדש.
+    """
+    db = get_db()
+    ref = db.collection("subjects").document(subject_id)
+    ref.update({"session_count": firestore.Increment(1)})
+    return ref.get().to_dict().get("session_count", 0)
+
+
+# ══════════════════════════════════════════
 # SESSIONS — סשני בדיקה
 # ══════════════════════════════════════════
 
