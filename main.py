@@ -27,12 +27,19 @@ from pathlib import Path
 # from services.affinity_calculator import calculate_affinity
 
 from services.firebase_service import (
-    create_subject, get_subject, list_subjects,
+    get_db, create_subject, get_subject, list_subjects,
     create_session, update_session_status, get_session, list_sessions,
     get_emotion_results, get_conclusion, list_conclusions,
     save_full_session_results, upload_session_video, upload_session_timeline,
     generate_signed_video_url, generate_signed_timeline_url,
+    update_login_credentials, complete_subject_profile, increment_session_count,
 )
+
+# שלב 1 (תוכנית העבודה — אבטחה ופרטיות): אימות נבדקים אמיתי דרך Firebase
+# Authentication. ה-import הזה חייב לבוא אחרי ה-import מ-firebase_service
+# למעלה, כי הוא מה שמאתחל את firebase_admin (דרך get_db בתוך אחת הפונקציות
+# שיובאו) — בלעדי אתחול קודם, firebase_admin.auth לא יודע לאיזה פרויקט לפנות.
+from firebase_admin import auth as firebase_auth
 
 # ══════════════════════════════════════════
 # שלב 0 (תוכנית העבודה — אבטחה ופרטיות): נעילת הבקאנד
@@ -47,6 +54,34 @@ if not API_SHARED_SECRET:
 async def verify_shared_secret(x_api_key: str = Header(None)):
     if not API_SHARED_SECRET or x_api_key != API_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ══════════════════════════════════════════
+# שלב 1 (תוכנית העבודה — אבטחה ופרטיות): אימות אישי לנבדקים
+# ══════════════════════════════════════════
+# להבדיל מ-verify_shared_secret למעלה (סוד אחד משותף לכל האפליקציה), כל נבדק
+# שולח כעת גם Authorization: Bearer <idToken> — טוקן אישי שה-SDK של Firebase
+# בפרונט מנפיק לו לאחר התחברות (Email/Password עם פסבדו-אימייל, ראו
+# WelcomePage/SignInPage/SignUpPage). הבקאנד מאמת את הטוקן מול Firebase עצמו
+# (לא סומך על שום דבר שהלקוח טוען) ומוציא ממנו את ה-uid האמיתי + ה-custom
+# claim role. ה-uid הזה הוא בדיוק מזהה המסמך ב-subjects/{uid} (ראו
+# firebase_service.create_provisioned_subject) — כך שאין אפשרות לנבדק לפעול
+# בשם נבדק אחר, אפילו אם הוא מנסה לשלוח subject_id שלא שלו בפרמטר.
+#
+# משמש רק את ה-endpoints החדשים של זרימת הנבדק האמיתית (/auth/*,
+# /subjects/me/*) — שאר ה-endpoints הישנים ממשיכים כרגע עם verify_shared_secret
+# בלבד (ניקוי/איחוד בין שני סוגי האימות מתוכנן לשלב 1.9, לא כרגע).
+async def verify_subject_token(authorization: str = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    id_token = authorization[len("Bearer "):].strip()
+    get_db()  # מבטיח ש-firebase_admin כבר מאותחל לפני שפונים ל-auth
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if decoded.get("role") != "subject":
+        raise HTTPException(status_code=403, detail="Not a subject account")
+    return decoded
 
 # דומיין(ים) מורשים לקרוא לבקאנד — מחליף את allow_origins=["*"] הפתוח לכולם.
 # מוגדר דרך משתנה סביבה FRONTEND_ORIGIN ב-Render (אפשר כמה דומיינים מופרדים
@@ -103,6 +138,86 @@ def one_subject(subject_id: str):
         raise HTTPException(404, "Subject not found")
     return s
 
+# ── AUTH — זרימת הנבדק האמיתית (שלב 1) ──
+# כל ה-endpoints כאן מאומתים דרך verify_subject_token (טוקן Firebase אישי),
+# לא verify_shared_secret. ה-uid נלקח מהטוקן המאומת בלבד — אף endpoint כאן
+# לא מקבל subject_id כפרמטר מהלקוח, כדי שאף נבדק לא יוכל לפעול בשם נבדק אחר.
+
+@app.get("/auth/me")
+def auth_me(decoded=Depends(verify_subject_token)):
+    """
+    נקרא בכל כניסה לאתר אחרי ההתחברות, כדי שהפרונט ידע לאן לנתב את הנבדק:
+    needs_reset → מסך איפוס שם משתמש+סיסמא; profile_completed=False → טופס
+    פרטים אישיים; אחרת → מסך אישור "סשן שני/שלישי" לפי session_count.
+    """
+    uid = decoded["uid"]
+    subject = get_subject(uid)
+    if not subject:
+        raise HTTPException(404, "Subject not found")
+    return {
+        "uid": uid,
+        "login_username":    subject.get("login_username"),
+        "needs_reset":       subject.get("needs_reset", False),
+        "profile_completed": subject.get("profile_completed", False),
+        "session_count":     subject.get("session_count", 0),
+        "name":              subject.get("name"),
+        "gender":            subject.get("gender"),
+    }
+
+
+@app.post("/auth/reset")
+def auth_reset(new_username: str, new_password: str, decoded=Depends(verify_subject_token)):
+    """
+    איפוס חד-פעמי בכניסה הראשונה (needs_reset=True): הנבדק בוחר שם משתמש
+    וסיסמא משלו במקום אלה שנשלחו לו מראש. משנה גם את חשבון Firebase
+    Authentication עצמו (האימייל-הפסבדו שמשמש להתחברות) וגם את מסמך
+    ה-Firestore (login_username, needs_reset).
+    """
+    uid = decoded["uid"]
+    new_username = (new_username or "").strip().lower()
+    if len(new_username) < 3:
+        raise HTTPException(400, "שם המשתמש חייב להיות באורך 3 תווים לפחות")
+    if len(new_password) < 6:
+        raise HTTPException(400, "הסיסמא חייבת להיות באורך 6 תווים לפחות")
+
+    pseudo_email = f"{new_username}@hai-subjects.local"
+    try:
+        firebase_auth.update_user(uid, email=pseudo_email, password=new_password)
+    except firebase_auth.EmailAlreadyExistsError:
+        raise HTTPException(409, "שם המשתמש הזה תפוס — נסה שם אחר")
+    except Exception as e:
+        raise HTTPException(500, f"עדכון החשבון נכשל: {e}")
+
+    update_login_credentials(uid, new_username)
+    return {"ok": True, "login_username": new_username}
+
+
+@app.post("/subjects/me/profile")
+def subjects_me_profile(name: str, age: int = None, gender: str = None, notes: str = "",
+                         decoded=Depends(verify_subject_token)):
+    """
+    טופס הפרטים האישיים — פעם אחת בלבד, בסשן הראשון (אחרי שה-flag
+    profile_completed עובר ל-True, הטופס הזה לא יוצג יותר לנבדק הזה). ה-name
+    כאן הוא ששם התיקייה בסטוראג' ממשיך להסתמך עליו — בלי קשר ל-login_username.
+    """
+    uid = decoded["uid"]
+    if not name or not name.strip():
+        raise HTTPException(400, "נא להזין שם מלא")
+    complete_subject_profile(uid, name=name.strip(), age=age, gender=gender, notes=notes)
+    return {"ok": True}
+
+
+@app.post("/subjects/me/sessions")
+def subjects_me_new_session(protocol_version: str = "1.0", decoded=Depends(verify_subject_token)):
+    """
+    מחליף את POST /sessions הישן (שמקבל subject_id מהלקוח) לזרימת הנבדק
+    האמיתית — ה-subject_id נלקח מהטוקן המאומת (uid), לא מפרמטר, כך שנבדק לא
+    יכול ליצור סשן על שם נבדק אחר.
+    """
+    uid = decoded["uid"]
+    session_id = create_session(subject_id=uid, protocol_version=protocol_version)
+    return {"session_id": session_id, "subject_id": uid}
+
 # ── SESSIONS ──
 @app.post("/sessions", dependencies=[Depends(verify_shared_secret)])
 def new_session(subject_id: str, protocol_version: str = "1.0"):
@@ -149,6 +264,15 @@ async def analyze(
         update_session_status(session_id, "recorded", video_path=storage_url, timeline_path=timeline_url)
         # מחיקת העותק המקומי אחרי העלאה מוצלחת — חוסך מקום בדיסק הזמני של Render
         video_path.unlink(missing_ok=True)
+
+        # שלב 1: מונה הסשנים שנשמרו בהצלחה לנבדק הזה — זה מה שמאפשר למסך
+        # הכניסה הבא לדעת אוטומטית שזו הכניסה ל"סשן השני/שלישי" (ראו
+        # GET /auth/me) ולהציג את מסך האישור במקום טופס פרטים אישיים. עולה
+        # רק כאן, כלומר רק כשהווידאו נשמר בפועל — לא בכל קריאה ל-/analyze.
+        try:
+            increment_session_count(subject_id)
+        except Exception as ce:
+            print(f"⚠️ Failed to increment session_count for subject {subject_id}: {ce}")
     except Exception as e:
         # אם ההעלאה ל-Firebase נכשלה, לפחות שומרים את הנתיב המקומי כדי לא לאבד
         # את ההקלטה (אם Render לא התאתחל בינתיים), ומתעדים את השגיאה.
