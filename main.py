@@ -19,6 +19,7 @@ import uvicorn
 import uuid
 import shutil
 import os
+import re
 from pathlib import Path
 
 # ── מושבת זמנית (ML כבד) — ראה הערה למעלה כדי להחזיר ──
@@ -174,9 +175,17 @@ def auth_reset(new_username: str, new_password: str, decoded=Depends(verify_subj
     ה-Firestore (login_username, needs_reset).
     """
     uid = decoded["uid"]
-    new_username = (new_username or "").strip().lower()
+    # סניטציה — חייבת להיות זהה בדיוק ל-usernameToPseudoEmail ב-firebase.js
+    # בפרונט: Firebase, ב-Email/Password sign-in, לא מקבל רווחים או תווים
+    # מיוחדים בחלק שלפני ה-@. מחליפים רווחים ב-"_" ומסננים כל תו שאינו
+    # אות/ספרה/"_"/"."/"-", כדי שמשתמש שמקליד "dana cohen" עם רווח לא ייתקל
+    # ב-INVALID_EMAIL — ושה-login_username שנשמר יתאים בדיוק למה שהפרונט
+    # יבנה שוב בהתחברות הבאה מאותה הקלדה.
+    raw_username = (new_username or "").strip().lower()
+    new_username = re.sub(r"\s+", "_", raw_username)
+    new_username = re.sub(r"[^a-z0-9_.-]", "", new_username)
     if len(new_username) < 3:
-        raise HTTPException(400, "שם המשתמש חייב להיות באורך 3 תווים לפחות")
+        raise HTTPException(400, "שם המשתמש חייב להיות באורך 3 תווים לפחות (אותיות באנגלית/ספרות בלבד)")
     if len(new_password) < 6:
         raise HTTPException(400, "הסיסמא חייבת להיות באורך 6 תווים לפחות")
 
