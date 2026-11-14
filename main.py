@@ -84,6 +84,34 @@ async def verify_subject_token(authorization: str = Header(None)) -> dict:
         raise HTTPException(status_code=403, detail="Not a subject account")
     return decoded
 
+# ══════════════════════════════════════════
+# שלב 2.3 (תוכנית העבודה — אבטחה ופרטיות): הרשאת admin אמיתית ל-endpoints רגישים
+# ══════════════════════════════════════════
+# בדיוק כמו verify_subject_token למעלה, רק בודק role == "admin" במקום
+# role == "subject". ה-admin היחיד שקיים כרגע הוא זה שנוצר ב-
+# create_admin_account.py, ואיתו מתחברים גם ב-AccessGate בפרונט (App.js).
+#
+# משמש רק את שלושת ה-endpoints שמחזירים את *כל* הרשומות בלי שום סינון
+# (כל הנבדקים / כל הסשנים / כל המסקנות) — אלה בדיוק ה-endpoints שהסקירה
+# סימנה כ"קריטיים": מי שמחלץ את ה-API Key המשותף (שגלוי לכל מי שבודק את
+# תעבורת האתר בדפדפן) יכול איתו לשלוף נתונים אישיים (שם/גיל/הערות) על כל
+# נבדק במערכת, לא רק על אחד שהוא כבר יודע עליו. endpoints אחרים שמקבלים
+# מזהה ספציפי (subject_id/session_id בודד שכבר ידוע לקורא) נשארים כרגע עם
+# verify_shared_secret בלבד, כדי לא לשבור את זרימת הנבדק/הניתוח הקיימת
+# בלי לבדוק קודם את כל העמודים שתלויים בהם.
+async def verify_admin_token(authorization: str = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    id_token = authorization[len("Bearer "):].strip()
+    get_db()  # מבטיח ש-firebase_admin כבר מאותחל לפני שפונים ל-auth
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if decoded.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return decoded
+
 # דומיין(ים) מורשים לקרוא לבקאנד — מחליף את allow_origins=["*"] הפתוח לכולם.
 # מוגדר דרך משתנה סביבה FRONTEND_ORIGIN ב-Render (אפשר כמה דומיינים מופרדים
 # בפסיק, למשל דומיין production + דומייני preview של Vercel). חשוב: חייבים
@@ -128,7 +156,7 @@ def new_subject(name: str, age: int = None, notes: str = ""):
     subject_id = create_subject(name=name, age=age, notes=notes)
     return {"subject_id": subject_id, "name": name}
 
-@app.get("/subjects", dependencies=[Depends(verify_shared_secret)])
+@app.get("/subjects", dependencies=[Depends(verify_admin_token)])
 def all_subjects():
     return list_subjects()
 
@@ -300,7 +328,7 @@ def one_session(session_id: str):
         raise HTTPException(404, "Session not found")
     return s
 
-@app.get("/sessions", dependencies=[Depends(verify_shared_secret)])
+@app.get("/sessions", dependencies=[Depends(verify_admin_token)])
 def all_sessions(subject_id: str = None):
     return list_sessions(subject_id=subject_id)
 
@@ -319,7 +347,7 @@ def session_conclusion(session_id: str):
         raise HTTPException(404, "Conclusion not found")
     return conclusion
 
-@app.get("/conclusions", dependencies=[Depends(verify_shared_secret)])
+@app.get("/conclusions", dependencies=[Depends(verify_admin_token)])
 def all_conclusions(subject_id: str = None):
     return list_conclusions(subject_id=subject_id)
 
