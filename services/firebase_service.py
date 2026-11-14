@@ -174,6 +174,40 @@ def increment_session_count(subject_id: str) -> int:
 
 
 # ══════════════════════════════════════════
+# שלב 4 (תוכנית העבודה — אבטחה ופרטיות): תיעוד הסכמה מדעת
+# ══════════════════════════════════════════
+# לפני התיקון הזה, SubjectTosPage.js (מסך "תנאי שימוש והסכמה מדעת") היה רק
+# UI — תיבת סימון שחוסמת את כפתור ההמשך, בלי שום רשומה שנשמרת בשום מקום. זה
+# אומר שלא היה שום תיעוד, בדיעבד, שנבדק מסוים באמת הסכים ומתי. collection
+# נפרד (לא שדה בודד על מסמך ה-subject) כדי שתהיה לנו רשומה-לכל-אירוע: המסך
+# הזה מוצג בכל התחברות (גם ראשונה וגם חוזרת — ראו ההערה ב-SubjectTosPage.js),
+# ולכן כל הסכמה היא אירוע בפני עצמו, לא רק "דגל" שמתעדכן. policy_version
+# מאפשר בעתיד לדעת בדיוק לאיזה נוסח של התנאים הנבדק הסכים, גם אם הנוסח
+# המשפטי הסופי (שלב 4, עדיין לא נכתב) יוחלף בהמשך.
+def save_consent(subject_id: str, policy_version: str = "1.0") -> str:
+    db = get_db()
+    doc_ref = db.collection("consents").document()
+    doc_ref.set({
+        "subject_id":      subject_id,
+        "policy_version":  policy_version,
+        "agreed_at":       datetime.utcnow(),
+    })
+    return doc_ref.id
+
+
+def list_consents(subject_id: str = None) -> list[dict]:
+    """
+    רשימת כל רשומות ההסכמה (או רק של נבדק ספציפי) — לשימוש עתידי אם תצטרך
+    להראות הוכחת הסכמה (למשל לרשות מפקחת, או לנבדק שמבקש לדעת מה אישר).
+    """
+    db = get_db()
+    q = db.collection("consents").order_by("agreed_at", direction=firestore.Query.DESCENDING)
+    if subject_id:
+        q = q.where("subject_id", "==", subject_id)
+    return [{"id": d.id, **d.to_dict()} for d in q.stream()]
+
+
+# ══════════════════════════════════════════
 # SESSIONS — סשני בדיקה
 # ══════════════════════════════════════════
 
