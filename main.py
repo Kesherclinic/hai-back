@@ -34,6 +34,7 @@ from services.firebase_service import (
     save_full_session_results, upload_session_video, upload_session_timeline,
     generate_signed_video_url, generate_signed_timeline_url,
     update_login_credentials, complete_subject_profile, increment_session_count,
+    save_consent,
 )
 
 # שלב 1 (תוכנית העבודה — אבטחה ופרטיות): אימות נבדקים אמיתי דרך Firebase
@@ -267,6 +268,18 @@ def auth_reset(new_username: str, new_password: str, decoded=Depends(verify_subj
 
     update_login_credentials(uid, new_username)
     return {"ok": True, "login_username": new_username}
+
+
+# שלב 4 (תוכנית העבודה — אבטחה ופרטיות): תיעוד הסכמה מדעת. נקרא מ-
+# SubjectTosPage.js ברגע שהנבדק לוחץ "אני מסכים/ה, המשך" (בכל כניסה, לא רק
+# בפעם הראשונה — ראו ההערה בעמוד עצמו) — לפני פנייה ל-/auth/me, כדי שהרשומה
+# תישמר גם אם משהו נכשל בניווט שאחרי. uid נלקח מהטוקן המאומת בלבד, לא מפרמטר,
+# כמו בשאר ה-endpoints כאן.
+@app.post("/subjects/me/consent")
+def subjects_me_consent(policy_version: str = "1.0", decoded=Depends(verify_subject_token)):
+    uid = decoded["uid"]
+    consent_id = save_consent(uid, policy_version=policy_version)
+    return {"ok": True, "consent_id": consent_id}
 
 
 @app.post("/subjects/me/profile")
