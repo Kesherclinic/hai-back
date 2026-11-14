@@ -112,6 +112,43 @@ async def verify_admin_token(authorization: str = Header(None)) -> dict:
         raise HTTPException(status_code=403, detail="Admin access required")
     return decoded
 
+# ══════════════════════════════════════════
+# שלב 2.4/2.5 (תוכנית העבודה — אבטחה ופרטיות): בדיקת "בעלות" על סשן ספציפי
+# ══════════════════════════════════════════
+# להבדיל מ-verify_subject_token/verify_admin_token למעלה (שבודקים role אחד
+# ספציפי), כאן גם נבדק וגם admin מורשים להגיע ל-endpoint — אבל מי שנגשים אליו
+# בפועל תלוי ברשומה הספציפית שמתבקשת (session_id נתון), ולא ניתן להכריע את זה
+# מראש ב-dependency בלי לטעון את הרשומה. לכן verify_subject_or_admin_token
+# רק מאמת את הטוקן ומחזיר אותו, וכל endpoint קורא בעצמו ל-_require_owner_or_admin
+# אחרי שהוא כבר יודע למי שייכת הרשומה (session["subject_id"] וכו').
+#
+# משמש את ה-endpoints שמקבלים session_id ספציפי שכבר ידוע לקורא (לא רשימות
+# מלאות — אלה כבר מוגנות ב-verify_admin_token למעלה): POST /analyze/{id},
+# GET /sessions/{id}, GET /results/{id}, GET /conclusions/{id},
+# GET /recordings/{id}/video|timeline. קודם כל חמשת ה-endpoints האלה בדקו רק
+# את ה-API Key המשותף — מי שהחזיק אותו (גלוי בדפדפן לכל אחד) וגם הצליח לקבל
+# איכשהו session_id ספציפי (למשל דליפה של קישור) יכל לגשת לנתונים/להעלות וידאו
+# לכל סשן, לא רק לסשן שהוא עצמו פתח. מעכשיו גם מי שמחזיק ID ספציפי לא שלו
+# יידחה, אלא אם הוא admin.
+async def verify_subject_or_admin_token(authorization: str = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    id_token = authorization[len("Bearer "):].strip()
+    get_db()
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if decoded.get("role") not in ("subject", "admin"):
+        raise HTTPException(status_code=403, detail="Unrecognized account role")
+    return decoded
+
+def _require_owner_or_admin(decoded: dict, owner_subject_id: str) -> None:
+    if decoded.get("role") == "admin":
+        return
+    if decoded.get("uid") != owner_subject_id:
+        raise HTTPException(status_code=403, detail="הסשן הזה לא שלך")
+
 # דומיין(ים) מורשים לקרוא לבקאנד — מחליף את allow_origins=["*"] הפתוח לכולם.
 # מוגדר דרך משתנה סביבה FRONTEND_ORIGIN ב-Render (אפשר כמה דומיינים מופרדים
 # בפסיק, למשל דומיין production + דומייני preview של Vercel). חשוב: חייבים
@@ -151,7 +188,10 @@ def root():
     return {"status": "HAI backend running (recording only)", "version": "1.1.0-recording-only"}
 
 # ── SUBJECTS ──
-@app.post("/subjects", dependencies=[Depends(verify_shared_secret)])
+# שלב 2.3: יצירת נבדק "אנונימי" (זרימת האינטייק הישנה של הסגל — IntakePage.js)
+# אין כאן זהות נבדק אמיתית ליצור "בעלות" עליה, אז דורשים admin בלבד (לא
+# verify_shared_secret הישן), בדיוק כמו שאר כלי הסגל.
+@app.post("/subjects", dependencies=[Depends(verify_admin_token)])
 def new_subject(name: str, age: int = None, notes: str = ""):
     subject_id = create_subject(name=name, age=age, notes=notes)
     return {"subject_id": subject_id, "name": name}
@@ -256,22 +296,29 @@ def subjects_me_new_session(protocol_version: str = "1.0", decoded=Depends(verif
     return {"session_id": session_id, "subject_id": uid}
 
 # ── SESSIONS ──
-@app.post("/sessions", dependencies=[Depends(verify_shared_secret)])
+# שלב 2.3: אותו היגיון כמו POST /subjects למעלה — זרימת האינטייק הישנה, admin בלבד.
+@app.post("/sessions", dependencies=[Depends(verify_admin_token)])
 def new_session(subject_id: str, protocol_version: str = "1.0"):
     session_id = create_session(subject_id=subject_id, protocol_version=protocol_version)
     return {"session_id": session_id, "subject_id": subject_id}
 
-@app.post("/analyze/{session_id}", dependencies=[Depends(verify_shared_secret)])
+# שלב 2.4/2.5: במקום verify_shared_secret, דורש טוקן אמיתי (נבדק או admin) ובודק
+# בעלות על הסשן הספציפי הזה — ראו verify_subject_or_admin_token/_require_owner_or_admin
+# למעלה. כך רק הנבדק שבאמת פתח את הסשן (uid שלו == session["subject_id"]) או admin
+# יכולים להעלות וידאו אליו; מי שרק מחזיק את ה-session_id (למשל דלף) לא יכול.
+@app.post("/analyze/{session_id}")
 async def analyze(
     session_id: str,
     background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     stimulus_map: str = Form(None),
     timeline: str = Form(None),
+    decoded: dict = Depends(verify_subject_or_admin_token),
 ):
     session = get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
+    _require_owner_or_admin(decoded, session["subject_id"])
     video_path = UPLOAD_DIR / f"{session_id}.webm"
     with open(video_path, "wb") as f:
         shutil.copyfileobj(video.file, f)
@@ -321,11 +368,13 @@ async def analyze(
 
     return {"session_id": session_id, "status": "recorded"}
 
-@app.get("/sessions/{session_id}", dependencies=[Depends(verify_shared_secret)])
-def one_session(session_id: str):
+# שלב 2.4/2.5: אותו היגיון — נדרש טוקן אמיתי + בעלות על הסשן הספציפי הזה.
+@app.get("/sessions/{session_id}")
+def one_session(session_id: str, decoded: dict = Depends(verify_subject_or_admin_token)):
     s = get_session(session_id)
     if not s:
         raise HTTPException(404, "Session not found")
+    _require_owner_or_admin(decoded, s["subject_id"])
     return s
 
 @app.get("/sessions", dependencies=[Depends(verify_admin_token)])
@@ -333,18 +382,27 @@ def all_sessions(subject_id: str = None):
     return list_sessions(subject_id=subject_id)
 
 # ── RESULTS (לא יחזירו כלום כל עוד הניתוח מושבת — זה תקין, לא באג) ──
-@app.get("/results/{session_id}", dependencies=[Depends(verify_shared_secret)])
-def session_results(session_id: str):
+# שלב 2.4/2.5: emotion_results לא כולל subject_id משלו, אז בודקים בעלות דרך
+# הסשן עצמו (get_session) לפני שמחזירים את התוצאות.
+@app.get("/results/{session_id}")
+def session_results(session_id: str, decoded: dict = Depends(verify_subject_or_admin_token)):
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    _require_owner_or_admin(decoded, session["subject_id"])
     results = get_emotion_results(session_id)
     if not results:
         raise HTTPException(404, "Results not found")
     return results
 
-@app.get("/conclusions/{session_id}", dependencies=[Depends(verify_shared_secret)])
-def session_conclusion(session_id: str):
+# שלב 2.4/2.5: conclusions כבר כולל subject_id משלו (ראו save_conclusion),
+# אז אין צורך לטעון גם את הסשן בנפרד.
+@app.get("/conclusions/{session_id}")
+def session_conclusion(session_id: str, decoded: dict = Depends(verify_subject_or_admin_token)):
     conclusion = get_conclusion(session_id)
     if not conclusion:
         raise HTTPException(404, "Conclusion not found")
+    _require_owner_or_admin(decoded, conclusion.get("subject_id"))
     return conclusion
 
 @app.get("/conclusions", dependencies=[Depends(verify_admin_token)])
@@ -357,21 +415,24 @@ def all_conclusions(subject_id: str = None):
 # מאומתת לבקאנד. ה-URL עצמו עדיין לא דורש התחברות (זו מגבלה של signed URLs),
 # אבל הוא נוצר רק למי שכבר עבר את verify_shared_secret וגם פג תוקף במהירות —
 # שיפור משמעותי לעומת טוקן שחי לנצח.
-@app.get("/recordings/{session_id}/video", dependencies=[Depends(verify_shared_secret)])
-def recording_video_url(session_id: str):
+# שלב 2.4/2.5: אותו היגיון — קישור חתום להקלטה של סשן ספציפי דורש בעלות עליו.
+@app.get("/recordings/{session_id}/video")
+def recording_video_url(session_id: str, decoded: dict = Depends(verify_subject_or_admin_token)):
     session = get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
+    _require_owner_or_admin(decoded, session["subject_id"])
     url = generate_signed_video_url(session["subject_id"], session_id)
     if not url:
         raise HTTPException(404, "Video not found")
     return {"url": url}
 
-@app.get("/recordings/{session_id}/timeline", dependencies=[Depends(verify_shared_secret)])
-def recording_timeline_url(session_id: str):
+@app.get("/recordings/{session_id}/timeline")
+def recording_timeline_url(session_id: str, decoded: dict = Depends(verify_subject_or_admin_token)):
     session = get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
+    _require_owner_or_admin(decoded, session["subject_id"])
     url = generate_signed_timeline_url(session["subject_id"], session_id)
     if not url:
         raise HTTPException(404, "Timeline not found")
