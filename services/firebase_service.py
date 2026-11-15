@@ -15,6 +15,8 @@ import json
 import csv
 import io
 import re
+import subprocess
+import imageio_ffmpeg
 
 # ── Firebase Storage bucket for this project ──
 FIREBASE_STORAGE_BUCKET = "hai-app-2ebc3.firebasestorage.app"
@@ -295,62 +297,113 @@ def get_subject_folder_name(subject_id: str) -> str:
     return _subject_folder_name(subject_id, name)
 
 
+def _convert_webm_to_mp4(webm_path: Path) -> Path:
+    """
+    שלב 6 (תוכנית העבודה — אבטחה ופרטיות): ממיר קובץ .webm (כך שהדפדפן
+    מקליט, VP8/VP9+Opus) ל-.mp4 תקני (H.264+AAC) — מקומית, על השרת עצמו,
+    בלי להעלות שום דבר לשום אתר/שירות המרה חיצוני. ffmpeg מגיע כבר ארוז
+    בתוך חבילת imageio-ffmpeg (בינארי שהותקן יחד עם pip install), כך
+    שאין צורך להתקין שום דבר נוסף ברמת מערכת ההפעלה של Render.
+
+    מחזיר את הנתיב לקובץ ה-mp4 החדש. זורק חריגה אם ההמרה נכשלת (הקורא
+    אחראי לתפוס את זה וליפול בחזרה לקובץ ה-webm המקורי — ראו
+    upload_session_video למטה).
+    """
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    mp4_path = webm_path.with_suffix(".mp4")
+    cmd = [
+        ffmpeg_exe,
+        "-y",                         # דריסת קובץ פלט קודם אם קיים
+        "-i", str(webm_path),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-c:a", "aac",
+        "-movflags", "+faststart",    # מאפשר התחלת נגינה לפני שההורדה נגמרת
+        str(mp4_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not mp4_path.exists():
+        raise RuntimeError(f"ffmpeg נכשל (קוד {result.returncode}): {result.stderr[-2000:]}")
+    return mp4_path
+
+
 def upload_session_video(subject_id: str, session_id: str, local_path: Path) -> str:
     """
     Uploads a subject's recorded session video (local .webm file, currently
     sitting on Render's ephemeral disk) to Firebase Storage, so it survives
     server restarts/redeploys and is reachable by Nico at any time.
 
-    Stored at: recordings/{subject name + short id}/{session_id}.webm —
+    שלב 6: לפני ההעלאה, הקובץ מומר מ-webm ל-mp4 מקומית (ראו
+    _convert_webm_to_mp4 למעלה) — כדי שלא יהיה צורך להעלות הקלטות רגישות
+    של נבדקים לשום אתר המרה חיצוני כדי לקבל mp4 אמיתי. אם ההמרה נכשלת
+    מסיבה כלשהי (מקרה חריג), נופלים בחזרה להעלאת ה-webm המקורי כגיבוי —
+    כדי שלא לאבד את ההקלטה בשום מקרה — והשגיאה מתועדת בלוג.
+
+    הקובץ המועלה גם מסומן Content-Disposition: attachment, כך שפתיחת
+    הקישור (דרך generate_signed_video_url) גורמת להורדה ממשית של קובץ
+    mp4, במקום נגינה "זורמת" בתוך הדפדפן.
+
+    Stored at: recordings/{subject name + short id}/{session_id}.mp4 —
     grouped in a per-subject folder, alongside that same session's timeline
-    CSV (see upload_session_timeline below), so both files for a given
-    subject sit together in Storage.
-    Returns a public Firebase Storage download URL (same format used for the
-    baseline relaxation video).
+    CSV (see upload_session_timeline below).
+    Returns the Storage path (not a public URL — אין יותר טוקן גישה
+    ציבורי קבוע; צפייה/הורדה בפועל עוברת תמיד דרך generate_signed_video_url,
+    שדורשת אימות+בעלות קודם).
 
     NOTE: sessions recorded before this change are still sitting at the old
-    flat path (recordings/{session_id}.webm), or the earlier
-    recordings/{subject_id}/... path — they are not moved.
+    .webm path — generate_signed_video_url למטה יודעת למצוא גם אותן.
     """
     get_db()  # ensures firebase_admin app (with storageBucket) is initialized
 
     folder = get_subject_folder_name(subject_id)
-    storage_path = f"recordings/{folder}/{session_id}.webm"
+
+    try:
+        upload_path = _convert_webm_to_mp4(local_path)
+        storage_path = f"recordings/{folder}/{session_id}.mp4"
+        content_type = "video/mp4"
+    except Exception as e:
+        print(f"⚠️ המרת mp4 נכשלה, נופל בחזרה להעלאת ה-webm המקורי: {e}")
+        upload_path = local_path
+        storage_path = f"recordings/{folder}/{session_id}.webm"
+        content_type = "video/webm"
+
     bucket = storage.bucket()
     blob = bucket.blob(storage_path)
-    blob.upload_from_filename(str(local_path))
-
-    # Attach a download token so the file is fetchable via a stable public URL
-    # (same mechanism Firebase Console uses when you click "Get download URL").
-    token = str(uuid.uuid4())
-    blob.metadata = {"firebaseStorageDownloadTokens": token}
+    blob.upload_from_filename(str(upload_path), content_type=content_type)
+    blob.content_disposition = f'attachment; filename="{session_id}.{storage_path.rsplit(".", 1)[-1]}"'
     blob.patch()
 
-    download_url = (
-        f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
-        f"/o/{quote(storage_path, safe='')}?alt=media&token={token}"
-    )
+    # מנקים את קובץ ה-mp4 הזמני שנוצר (לא את ה-local_path המקורי — על זה
+    # אחראי הקוד שקרא לפונקציה הזו, ב-main.py).
+    if upload_path != local_path:
+        upload_path.unlink(missing_ok=True)
+
     print(f"✅ Session video uploaded to Firebase Storage: {storage_path}")
-    return download_url
+    return storage_path
 
 
 def generate_signed_video_url(subject_id: str, session_id: str, expires_minutes: int = 10) -> str | None:
     """
     שלב 0 (תוכנית העבודה — אבטחה ופרטיות): קישור הורדה זמני לסרטון, שפג תוקפו
     אחרי expires_minutes דקות ונוצר רק דרך קריאה מאומתת לבקאנד (ראו
-    /recordings/{session_id}/video ב-main.py) — במקום הטוקן הציבורי הקבוע
-    שמוחזר מ-upload_session_video (שעדיין קיים כרגע לצורך תאימות לאחור, ראו
-    הערה שם). מחזיר None אם הקובץ לא קיים בסטוראג'.
+    /recordings/{session_id}/video ב-main.py) — במקום טוקן ציבורי קבוע.
+
+    שלב 6: מנסה קודם למצוא גרסת mp4 (הפורמט הנוכחי, מאז שהוספנו המרה
+    אוטומטית). אם היא לא קיימת, נופל בחזרה לחיפוש webm — זה מכסה גם
+    סשנים ישנים שנשמרו לפני השינוי הזה, וגם את המקרה החריג שבו ההמרה
+    נכשלה לסשן מסוים ונשמר רק webm. מחזיר None אם שום קובץ לא נמצא.
     """
     get_db()
     folder = get_subject_folder_name(subject_id)
-    storage_path = f"recordings/{folder}/{session_id}.webm"
     bucket = storage.bucket()
-    blob = bucket.blob(storage_path)
-    if not blob.exists():
-        return None
+
     from datetime import timedelta
-    return blob.generate_signed_url(expiration=timedelta(minutes=expires_minutes), version="v4")
+    for ext in ("mp4", "webm"):
+        storage_path = f"recordings/{folder}/{session_id}.{ext}"
+        blob = bucket.blob(storage_path)
+        if blob.exists():
+            return blob.generate_signed_url(expiration=timedelta(minutes=expires_minutes), version="v4")
+    return None
 
 
 def _expand_timeline_to_csv(timeline_json: str) -> str:
