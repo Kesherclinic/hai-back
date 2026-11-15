@@ -340,13 +340,29 @@ async def analyze(
 
     # מצב הקלטה בלבד: שומר את הסרטון ומסמן "recorded" — בלי להפעיל ניתוח ביומטרי.
     # כדי להחזיר את הניתוח המלא, מחק את השורה עם upload_session_video/update_session_status
-    # למטה והחזר את שתי השורות המוערות שאחריה.
+    # ב-_finish_video_upload למטה והחזר את שתי השורות המוערות שאחריה.
     #
-    # הדיסק של Render הוא זמני (ephemeral) — קבצים שנשמרים רק שם נמחקים בכל
-    # הפעלה מחדש/דיפלוי. לכן מעלים את ההקלטה ל-Firebase Storage מיד אחרי
-    # השמירה המקומית, כדי שהיא תישמר לצמיתות ותהיה נגישה לך בכל זמן.
+    # שלב 6 (תוכנית העבודה — אבטחה ופרטיות): המרת הסרטון ל-mp4 (ראו
+    # firebase_service.upload_session_video) לוקחת זמן עיבוד אמיתי — אז
+    # במקום לגרום לנבדק לחכות עם זה במסך, מסמנים סטטוס ביניים "processing"
+    # ומריצים את ההמרה+ההעלאה ברקע (background_tasks), אחרי שכבר עונים
+    # לדפדפן שלו. הדיסק של Render הוא זמני (ephemeral) — קבצים שנשמרים רק
+    # שם נמחקים בכל הפעלה מחדש/דיפלוי, אז ה-upload עדיין קורה בהקדם, רק
+    # לא תוך כדי שהנבדק מחכה.
+    update_session_status(session_id, "processing")
+    background_tasks.add_task(_finish_video_upload, subject_id, session_id, video_path, timeline)
+
+    return {"session_id": session_id, "status": "processing"}
+
+
+def _finish_video_upload(subject_id: str, session_id: str, video_path: Path, timeline: str | None):
+    """
+    רץ ברקע (background_tasks, ראו analyze() למעלה) אחרי שכבר ענינו לדפדפן
+    של הנבדק: ממיר את ההקלטה ל-mp4, מעלה אותה ל-Firebase Storage (יחד עם
+    טבלת ציר הזמן אם קיימת), ומעדכן את סטטוס הסשן ל-"recorded" בסיום.
+    """
     try:
-        storage_url = upload_session_video(subject_id, session_id, video_path)
+        storage_path = upload_session_video(subject_id, session_id, video_path)
 
         # טבלת הזמנים (מה הנבדק נחשף אליו בכל שנייה) — מועלית בנפרד, לתוך אותה
         # תיקיית נבדק. אם ההעלאה הזו נכשלת, זה לא אמור לפגוע בשמירת הסרטון עצמו
@@ -358,7 +374,7 @@ async def analyze(
             except Exception as te:
                 print(f"⚠️ Failed to upload session timeline to Firebase Storage: {te}")
 
-        update_session_status(session_id, "recorded", video_path=storage_url, timeline_path=timeline_url)
+        update_session_status(session_id, "recorded", video_path=storage_path, timeline_path=timeline_url)
         # מחיקת העותק המקומי אחרי העלאה מוצלחת — חוסך מקום בדיסק הזמני של Render
         video_path.unlink(missing_ok=True)
 
@@ -375,11 +391,6 @@ async def analyze(
         # את ההקלטה (אם Render לא התאתחל בינתיים), ומתעדים את השגיאה.
         print(f"⚠️ Failed to upload session video to Firebase Storage: {e}")
         update_session_status(session_id, "recorded", video_path=str(video_path), storage_error=str(e))
-    # import json
-    # stimulus_map_parsed = json.loads(stimulus_map) if stimulus_map else {}
-    # background_tasks.add_task(run_full_analysis, session_id, session["subject_id"], video_path, stimulus_map_parsed)
-
-    return {"session_id": session_id, "status": "recorded"}
 
 # שלב 2.4/2.5: אותו היגיון — נדרש טוקן אמיתי + בעלות על הסשן הספציפי הזה.
 @app.get("/sessions/{session_id}")
