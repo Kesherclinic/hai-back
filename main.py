@@ -377,10 +377,18 @@ def _finish_video_upload(subject_id: str, session_id: str, video_path: Path, scr
     של הנבדק: ממיר את ההקלטה ל-mp4, מעלה אותה ל-Firebase Storage (יחד עם
     טבלת ציר הזמן אם קיימת), ומעדכן את סטטוס הסשן ל-"recorded" בסיום.
 
-    שלב 8: אם נשלחה גם הקלטת מסך (screen_path), היא מומרת ומועלית באותה
-    דרך בדיוק (kind="screen"), לקובץ נפרד לצד הקלטת המצלמה. כשל בהעלאת
+    שלב 8: אם נשלחה גם הקלטת מסך (screen_path), היא מועלית באותה דרך
+    בדיוק (kind="screen"), לקובץ נפרד לצד הקלטת המצלמה. כשל בהעלאת
     הקלטת המסך בלבד לא עוצר את שמירת הסרטון הראשי — זו תוספת לאבחון
     תקלות, לא הגיבוי עצמו — אבל מתועד בלוג כדי שלא יעבור בלי תשומת לב.
+
+    שלב 11 (תוכנית העבודה — אבטחה ופרטיות): לפי החלטת ניקו, שני הסרטונים
+    נשמרים כ-webm כמו שהם (convert=False) — בלי המרה ל-mp4 בשרת בכלל.
+    זה חוסך את שלב ה-ffmpeg כליל (היה הגורם המרכזי לזמן ההמתנה), ועדיין
+    יורד כקובץ אמיתי להורדה (Content-Disposition: attachment, ראו
+    upload_session_video) ולא כ"לינק"/זרימה בתוך הדפדפן — בלי קשר לסיומת.
+    המרה ל-mp4, כשתידרש, נעשית מקומית ביד (VLC/ffmpeg) על קובץ ספציפי,
+    לא באופן גורף על כל ההקלטות.
 
     שלב 9: progress מתקדם בנקודות ביניים קבועות (לא אחוז מדויק-לפי-בייט — אין
     לנו דרך פשוטה לכך בלי לפענח את הפלט של ffmpeg תוך כדי ריצה) כדי ש-
@@ -389,13 +397,13 @@ def _finish_video_upload(subject_id: str, session_id: str, video_path: Path, scr
     """
     try:
         update_session_status(session_id, "processing", progress=15)
-        storage_path = upload_session_video(subject_id, session_id, video_path, kind="camera")
+        storage_path = upload_session_video(subject_id, session_id, video_path, kind="camera", convert=False)
         update_session_status(session_id, "processing", progress=55 if screen_path is not None else 75)
 
         screen_storage_path = None
         if screen_path is not None:
             try:
-                screen_storage_path = upload_session_video(subject_id, session_id, screen_path, kind="screen")
+                screen_storage_path = upload_session_video(subject_id, session_id, screen_path, kind="screen", convert=False)
                 update_session_status(session_id, "processing", progress=85)
             except Exception as se:
                 print(f"⚠️ Failed to upload screen recording to Firebase Storage: {se}")
