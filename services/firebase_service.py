@@ -309,6 +309,9 @@ def _convert_webm_to_mp4(webm_path: Path) -> Path:
     אחראי לתפוס את זה וליפול בחזרה לקובץ ה-webm המקורי — ראו
     upload_session_video למטה).
     """
+    # שלב 10 (תוכנית העבודה — אבטחה ופרטיות): "ultrafast" במקום "veryfast" —
+    # קובץ פלט קצת יותר גדול, אבל קידוד מהיר יותר בפועל על ה-CPU המוגבל של
+    # Render, שמקצר את זמן ההמתנה הכולל של הנבדק.
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     mp4_path = webm_path.with_suffix(".mp4")
     cmd = [
@@ -316,7 +319,7 @@ def _convert_webm_to_mp4(webm_path: Path) -> Path:
         "-y",                         # דריסת קובץ פלט קודם אם קיים
         "-i", str(webm_path),
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "ultrafast",
         "-c:a", "aac",
         "-movflags", "+faststart",    # מאפשר התחלת נגינה לפני שההורדה נגמרת
         str(mp4_path),
@@ -327,7 +330,7 @@ def _convert_webm_to_mp4(webm_path: Path) -> Path:
     return mp4_path
 
 
-def upload_session_video(subject_id: str, session_id: str, local_path: Path, kind: str = "camera") -> str:
+def upload_session_video(subject_id: str, session_id: str, local_path: Path, kind: str = "camera", convert: bool = True) -> str:
     """
     Uploads a subject's recorded session video (local .webm file, currently
     sitting on Render's ephemeral disk) to Firebase Storage, so it survives
@@ -349,6 +352,11 @@ def upload_session_video(subject_id: str, session_id: str, local_path: Path, kin
     שם הקובץ בסטוראג' (סיומת "_screen" לפני ההרחבה), כדי שהשתיים לא ידרסו
     זו את זו באותה תיקיית נבדק.
 
+    שלב 10: convert=False מדלג על ההמרה ל-mp4 כליל ומעלה את ה-webm כמו
+    שהוא — נשאר כאופציה כאן (לא בשימוש כרגע, גם הקלטת המסך הופכת ל-mp4
+    בסוף, לפי העדפת ניקו), למקרה שיהיה רצוי בעתיד לחסוך את זמן ה-CPU
+    של ההמרה על חשבון קבלת webm במקום mp4.
+
     Stored at: recordings/{subject name + short id}/{session_id}.mp4 (camera)
     or recordings/{subject name + short id}/{session_id}_screen.mp4 (screen) —
     grouped in a per-subject folder, alongside that same session's timeline
@@ -365,15 +373,20 @@ def upload_session_video(subject_id: str, session_id: str, local_path: Path, kin
     folder = get_subject_folder_name(subject_id)
     suffix = "" if kind == "camera" else f"_{kind}"
 
-    try:
-        upload_path = _convert_webm_to_mp4(local_path)
-        storage_path = f"recordings/{folder}/{session_id}{suffix}.mp4"
-        content_type = "video/mp4"
-    except Exception as e:
-        print(f"⚠️ המרת mp4 נכשלה, נופל בחזרה להעלאת ה-webm המקורי: {e}")
+    if not convert:
         upload_path = local_path
         storage_path = f"recordings/{folder}/{session_id}{suffix}.webm"
         content_type = "video/webm"
+    else:
+        try:
+            upload_path = _convert_webm_to_mp4(local_path)
+            storage_path = f"recordings/{folder}/{session_id}{suffix}.mp4"
+            content_type = "video/mp4"
+        except Exception as e:
+            print(f"⚠️ המרת mp4 נכשלה, נופל בחזרה להעלאת ה-webm המקורי: {e}")
+            upload_path = local_path
+            storage_path = f"recordings/{folder}/{session_id}{suffix}.webm"
+            content_type = "video/webm"
 
     bucket = storage.bucket()
     blob = bucket.blob(storage_path)
