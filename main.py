@@ -324,6 +324,7 @@ async def analyze(
     session_id: str,
     background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
+    screen: UploadFile = File(None),
     stimulus_map: str = Form(None),
     timeline: str = Form(None),
     decoded: dict = Depends(verify_subject_or_admin_token),
@@ -335,6 +336,16 @@ async def analyze(
     video_path = UPLOAD_DIR / f"{session_id}.webm"
     with open(video_path, "wb") as f:
         shutil.copyfileobj(video.file, f)
+
+    # שלב 8 (תוכנית העבודה — אבטחה ופרטיות): הקלטת מסך הנבדק, לצד הקלטת
+    # המצלמה — ראו TestPage.js (getDisplayMedia, חובה מצד הנבדק). אופציונלי
+    # כאן בצד השרת בכוונה (File(None)), כדי שקריאה ישנה/חריגה בלי קובץ מסך
+    # לא תיכשל — אבל בפועל הגרסה הנוכחית של האתר שולחת אותו בכל בדיקה אמיתית.
+    screen_path = None
+    if screen is not None:
+        screen_path = UPLOAD_DIR / f"{session_id}_screen.webm"
+        with open(screen_path, "wb") as f:
+            shutil.copyfileobj(screen.file, f)
 
     subject_id = session["subject_id"]
 
@@ -349,20 +360,47 @@ async def analyze(
     # לדפדפן שלו. הדיסק של Render הוא זמני (ephemeral) — קבצים שנשמרים רק
     # שם נמחקים בכל הפעלה מחדש/דיפלוי, אז ה-upload עדיין קורה בהקדם, רק
     # לא תוך כדי שהנבדק מחכה.
-    update_session_status(session_id, "processing")
-    background_tasks.add_task(_finish_video_upload, subject_id, session_id, video_path, timeline)
+    # שלב 9 (תוכנית העבודה — אבטחה ופרטיות): progress=5 כבר כאן — נקודת ההתחלה
+    # שה-frontend (ProcessingPage) יראה ברגע שהוא מתחיל לבדוק את הסטטוס. בלי
+    # זה, progress היה תמיד 0 כל עוד אין ניתוח ביומטרי שמעדכן אותו (ולכן נראה
+    # "תקוע") — ראו הנקודות הבאות ב-_finish_video_upload שמקדמות את זה בהדרגה
+    # ככל שהעבודה בפועל (המרה+העלאה) מתקדמת.
+    update_session_status(session_id, "processing", progress=5)
+    background_tasks.add_task(_finish_video_upload, subject_id, session_id, video_path, screen_path, timeline)
 
     return {"session_id": session_id, "status": "processing"}
 
 
-def _finish_video_upload(subject_id: str, session_id: str, video_path: Path, timeline: str | None):
+def _finish_video_upload(subject_id: str, session_id: str, video_path: Path, screen_path: Path | None, timeline: str | None):
     """
     רץ ברקע (background_tasks, ראו analyze() למעלה) אחרי שכבר ענינו לדפדפן
     של הנבדק: ממיר את ההקלטה ל-mp4, מעלה אותה ל-Firebase Storage (יחד עם
     טבלת ציר הזמן אם קיימת), ומעדכן את סטטוס הסשן ל-"recorded" בסיום.
+
+    שלב 8: אם נשלחה גם הקלטת מסך (screen_path), היא מומרת ומועלית באותה
+    דרך בדיוק (kind="screen"), לקובץ נפרד לצד הקלטת המצלמה. כשל בהעלאת
+    הקלטת המסך בלבד לא עוצר את שמירת הסרטון הראשי — זו תוספת לאבחון
+    תקלות, לא הגיבוי עצמו — אבל מתועד בלוג כדי שלא יעבור בלי תשומת לב.
+
+    שלב 9: progress מתקדם בנקודות ביניים קבועות (לא אחוז מדויק-לפי-בייט — אין
+    לנו דרך פשוטה לכך בלי לפענח את הפלט של ffmpeg תוך כדי ריצה) כדי ש-
+    ProcessingPage יראה מספר שבאמת עולה במקום שיישאר תקוע על 0 עד שהכול
+    נגמר בבת אחת.
     """
     try:
-        storage_path = upload_session_video(subject_id, session_id, video_path)
+        update_session_status(session_id, "processing", progress=15)
+        storage_path = upload_session_video(subject_id, session_id, video_path, kind="camera")
+        update_session_status(session_id, "processing", progress=55 if screen_path is not None else 75)
+
+        screen_storage_path = None
+        if screen_path is not None:
+            try:
+                screen_storage_path = upload_session_video(subject_id, session_id, screen_path, kind="screen")
+                update_session_status(session_id, "processing", progress=85)
+            except Exception as se:
+                print(f"⚠️ Failed to upload screen recording to Firebase Storage: {se}")
+            finally:
+                screen_path.unlink(missing_ok=True)
 
         # טבלת הזמנים (מה הנבדק נחשף אליו בכל שנייה) — מועלית בנפרד, לתוך אותה
         # תיקיית נבדק. אם ההעלאה הזו נכשלת, זה לא אמור לפגוע בשמירת הסרטון עצמו
@@ -374,7 +412,13 @@ def _finish_video_upload(subject_id: str, session_id: str, video_path: Path, tim
             except Exception as te:
                 print(f"⚠️ Failed to upload session timeline to Firebase Storage: {te}")
 
-        update_session_status(session_id, "recorded", video_path=storage_path, timeline_path=timeline_url)
+        update_session_status(
+            session_id, "recorded",
+            video_path=storage_path,
+            screen_video_path=screen_storage_path,
+            timeline_path=timeline_url,
+            progress=100,
+        )
         # מחיקת העותק המקומי אחרי העלאה מוצלחת — חוסך מקום בדיסק הזמני של Render
         video_path.unlink(missing_ok=True)
 
