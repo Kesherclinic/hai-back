@@ -327,7 +327,7 @@ def _convert_webm_to_mp4(webm_path: Path) -> Path:
     return mp4_path
 
 
-def upload_session_video(subject_id: str, session_id: str, local_path: Path) -> str:
+def upload_session_video(subject_id: str, session_id: str, local_path: Path, kind: str = "camera") -> str:
     """
     Uploads a subject's recorded session video (local .webm file, currently
     sitting on Render's ephemeral disk) to Firebase Storage, so it survives
@@ -343,7 +343,14 @@ def upload_session_video(subject_id: str, session_id: str, local_path: Path) -> 
     הקישור (דרך generate_signed_video_url) גורמת להורדה ממשית של קובץ
     mp4, במקום נגינה "זורמת" בתוך הדפדפן.
 
-    Stored at: recordings/{subject name + short id}/{session_id}.mp4 —
+    שלב 8 (תוכנית העבודה — אבטחה ופרטיות): אותה פונקציה בדיוק משמשת גם
+    להעלאת הקלטת המסך של הנבדק (ראו TestPage.js) — kind="screen" — לצד
+    הקלטת המצלמה הרגילה (kind="camera", ברירת המחדל). ה-kind קובע רק את
+    שם הקובץ בסטוראג' (סיומת "_screen" לפני ההרחבה), כדי שהשתיים לא ידרסו
+    זו את זו באותה תיקיית נבדק.
+
+    Stored at: recordings/{subject name + short id}/{session_id}.mp4 (camera)
+    or recordings/{subject name + short id}/{session_id}_screen.mp4 (screen) —
     grouped in a per-subject folder, alongside that same session's timeline
     CSV (see upload_session_timeline below).
     Returns the Storage path (not a public URL — אין יותר טוקן גישה
@@ -356,21 +363,22 @@ def upload_session_video(subject_id: str, session_id: str, local_path: Path) -> 
     get_db()  # ensures firebase_admin app (with storageBucket) is initialized
 
     folder = get_subject_folder_name(subject_id)
+    suffix = "" if kind == "camera" else f"_{kind}"
 
     try:
         upload_path = _convert_webm_to_mp4(local_path)
-        storage_path = f"recordings/{folder}/{session_id}.mp4"
+        storage_path = f"recordings/{folder}/{session_id}{suffix}.mp4"
         content_type = "video/mp4"
     except Exception as e:
         print(f"⚠️ המרת mp4 נכשלה, נופל בחזרה להעלאת ה-webm המקורי: {e}")
         upload_path = local_path
-        storage_path = f"recordings/{folder}/{session_id}.webm"
+        storage_path = f"recordings/{folder}/{session_id}{suffix}.webm"
         content_type = "video/webm"
 
     bucket = storage.bucket()
     blob = bucket.blob(storage_path)
     blob.upload_from_filename(str(upload_path), content_type=content_type)
-    blob.content_disposition = f'attachment; filename="{session_id}.{storage_path.rsplit(".", 1)[-1]}"'
+    blob.content_disposition = f'attachment; filename="{session_id}{suffix}.{storage_path.rsplit(".", 1)[-1]}"'
     blob.patch()
 
     # מנקים את קובץ ה-mp4 הזמני שנוצר (לא את ה-local_path המקורי — על זה
@@ -382,7 +390,7 @@ def upload_session_video(subject_id: str, session_id: str, local_path: Path) -> 
     return storage_path
 
 
-def generate_signed_video_url(subject_id: str, session_id: str, expires_minutes: int = 10) -> str | None:
+def generate_signed_video_url(subject_id: str, session_id: str, expires_minutes: int = 10, kind: str = "camera") -> str | None:
     """
     שלב 0 (תוכנית העבודה — אבטחה ופרטיות): קישור הורדה זמני לסרטון, שפג תוקפו
     אחרי expires_minutes דקות ונוצר רק דרך קריאה מאומתת לבקאנד (ראו
@@ -392,14 +400,21 @@ def generate_signed_video_url(subject_id: str, session_id: str, expires_minutes:
     אוטומטית). אם היא לא קיימת, נופל בחזרה לחיפוש webm — זה מכסה גם
     סשנים ישנים שנשמרו לפני השינוי הזה, וגם את המקרה החריג שבו ההמרה
     נכשלה לסשן מסוים ונשמר רק webm. מחזיר None אם שום קובץ לא נמצא.
+
+    שלב 8: kind="screen" מחזיר קישור להקלטת המסך הנפרדת של אותו סשן, במקום
+    הקלטת המצלמה (kind="camera", ברירת המחדל) — ראו upload_session_video.
+    כרגע אין עדיין נתיב/כפתור באדמין שמשתמש ב-kind="screen" (הוחלט להשתמש
+    בינתיים בגישה ישירה דרך Firebase Storage כשצריך) — אבל האפשרות כאן
+    מוכנה לכשתרצה להוסיף קישור הורדה גם לזה.
     """
     get_db()
     folder = get_subject_folder_name(subject_id)
     bucket = storage.bucket()
+    suffix = "" if kind == "camera" else f"_{kind}"
 
     from datetime import timedelta
     for ext in ("mp4", "webm"):
-        storage_path = f"recordings/{folder}/{session_id}.{ext}"
+        storage_path = f"recordings/{folder}/{session_id}{suffix}.{ext}"
         blob = bucket.blob(storage_path)
         if blob.exists():
             return blob.generate_signed_url(expiration=timedelta(minutes=expires_minutes), version="v4")
